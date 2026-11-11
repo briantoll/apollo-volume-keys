@@ -7,9 +7,11 @@ cd "$(dirname "$0")"
 
 APP="build/Apollo Volume Keys.app"
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 swiftc -O -swift-version 5 main.swift -o "$APP/Contents/MacOS/ApolloVolumeKeys"
 cp Info.plist "$APP/Contents/Info.plist"
+# AppIcon.icns is checked in; regenerate it with `swift make-icon.swift`.
+cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 # Ad-hoc signature: macOS ties the Accessibility grant to it, so after a
 # rebuild you must remove and re-add the app under Privacy & Security.
 codesign --force --sign - "$APP"
