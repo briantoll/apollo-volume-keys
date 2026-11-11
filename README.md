@@ -18,10 +18,13 @@ keys and sets the monitor level through the UA Mixer Engine instead.
 
 - The keys are taken over **only while the Apollo is the default output** and
   the mixer engine is reachable. Otherwise they pass through to macOS as usual.
-- The menu-bar item shows the current level (`-32 dB`), `Muted`, `– dB` when
-  the engine is unreachable, or `⚠︎ Vol` until Accessibility is granted. It
-  follows the hardware knob and UAD Console live.
-- The menu has **Start at Login** and **Quit**.
+- The menu-bar item shows the current level (`-32 dB`) or `Muted`, and follows
+  the hardware knob and UAD Console live. It is there **only while the Apollo
+  is connected**; unplug or power off the Apollo and it disappears.
+- Until Accessibility is granted the item reads `⚠︎ Vol`; click it to open the
+  setting.
+- The item has no menu. Start at login and quitting are done from the
+  [command line](#command-line).
 - **There is no volume ceiling.** A held volume-up key will run all the way to
   0 dB, the Apollo's maximum. Mind your monitors.
 
@@ -43,8 +46,9 @@ Other Apollo models should work (the app finds the output UA marks as
 ```
 
 This compiles `main.swift`, wraps it in `Apollo Volume Keys.app`, copies it to
-`~/Applications` and launches it. `./build.sh` on its own only builds into
-`./build`.
+`~/Applications`, launches it, and puts the `apollo-volume-keys` command in
+`~/.local/bin` (which must be on your `PATH`). `./build.sh` on its own only
+builds into `./build`.
 
 Then grant **Accessibility** when prompted (System Settings ▸ Privacy &
 Security ▸ Accessibility). macOS requires it for an app to swallow the volume
@@ -53,6 +57,26 @@ keys.
 The app is ad-hoc signed, and macOS ties the Accessibility grant to that
 signature. After a rebuild, remove the app from the Accessibility list and add
 it again.
+
+## Command line
+
+| Command | Does |
+|---|---|
+| `apollo-volume-keys status` | Shows whether the app is running, whether it starts at login, and the Apollo's state |
+| `apollo-volume-keys start` | Launches the menu-bar app |
+| `apollo-volume-keys quit` | Quits it |
+| `apollo-volume-keys login on` / `off` | Starts the app at login, or stops doing so |
+
+Since the menu-bar item is hidden while the Apollo is disconnected, `status` is
+how to tell that the app is running:
+
+```
+App:            running
+Start at login: on
+Apollo:         connected, -32 dB
+```
+
+The command is the app's own binary run with an argument.
 
 ## Resource use
 
@@ -83,7 +107,9 @@ The app:
 
 1. walks `/devices` → `outputs` to find the output whose `IOType` is `Monitor`;
 2. subscribes to its `CRMonitorLevel` (dB, -96 to 0) and `Mute` values;
-3. installs an event tap for system-defined (media key) events and, on a
+3. subscribes to the device's `DeviceOnline` value, because the engine keeps
+   reporting the last level for an Apollo that has been unplugged;
+4. installs an event tap for system-defined (media key) events and, on a
    volume or mute key, writes the new value back with `set`.
 
 Because the API is undocumented, **a UA software update could break this.**
@@ -93,12 +119,16 @@ Because the API is undocumented, **a UA software update could break this.**
 - The event tap is registered for media-key events only, so ordinary
   keystrokes are never delivered to the app.
 - The only network connection is to `127.0.0.1:4710`. Nothing leaves the Mac.
-- It writes no files and has no dependencies beyond system frameworks.
+- It writes no files of its own (macOS records the menu-bar item's visibility
+  in the app's preferences) and has no dependencies beyond system frameworks.
 
 ## Uninstall
 
-Turn off **Start at Login** in the menu, quit the app, and delete
-`~/Applications/Apollo Volume Keys.app`.
+```sh
+apollo-volume-keys login off
+apollo-volume-keys quit
+rm -r ~/Applications/"Apollo Volume Keys.app" ~/.local/bin/apollo-volume-keys
+```
 
 ## Credits
 

@@ -21,14 +21,17 @@ final class Engine {
 
     private(set) var db: Double?      // nil until the engine has reported it
     private(set) var muted = false
+    private(set) var online = false   // the Apollo itself is connected and powered
     var onChange: () -> Void = {}
 
     private var conn: NWConnection?
     private var buffer = Data()
     private var monitor: String?      // e.g. "/devices/0/outputs/4"
 
-    /// True once the MONITOR output is found and its level is known.
-    var isLive: Bool { monitor != nil && db != nil }
+    /// True while the Apollo is connected and its MONITOR level is known. The
+    /// engine keeps reporting the last level for an unplugged Apollo, so the
+    /// level alone is not enough.
+    var isLive: Bool { online && monitor != nil && db != nil }
 
     func connect() {
         let c = NWConnection(host: "127.0.0.1", port: 4710, using: .tcp)
@@ -55,6 +58,7 @@ final class Engine {
         buffer.removeAll()
         monitor = nil
         db = nil
+        online = false
         onChange()
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
             if self?.conn == nil { self?.connect() }
@@ -63,6 +67,14 @@ final class Engine {
 
     func send(_ command: String) {
         conn?.send(content: Data(command.utf8) + [0], completion: .contentProcessed { _ in })
+    }
+
+    /// Called every few seconds. The engine's own clients write /Sleep to keep
+    /// the socket open. Also retries discovery, in case the engine listed no
+    /// device when we connected.
+    func keepAlive() {
+        send("set /Sleep false")
+        if monitor == nil { send("get /devices") }
     }
 
     private func receive(on c: NWConnection) {
@@ -84,10 +96,17 @@ final class Engine {
     }
 
     /// Discovery walks /devices -> outputs -> the output whose IOType is
-    /// "Monitor", then subscribes so knob and Console changes are pushed to us.
+    /// "Monitor", then subscribes so knob and Console changes are pushed to us,
+    /// as is the device going on- and offline.
     private func handle(_ path: String, _ data: Any?) {
         if path == "/devices" {
-            if let device = Self.children(data).first { send("get /devices/\(device)/outputs") }
+            if let device = Self.children(data).first {
+                send("subscribe /devices/\(device)/DeviceOnline/value")
+                send("get /devices/\(device)/outputs")
+            }
+        } else if path.hasSuffix("/DeviceOnline/value") {
+            online = data as? Bool ?? false
+            onChange()
         } else if path.hasSuffix("/outputs") {
             for output in Self.children(data) { send("get \(path)/\(output)/IOType/value") }
         } else if path.hasSuffix("/IOType/value") {
@@ -112,7 +131,7 @@ final class Engine {
 
     /// Move the level by `delta` dB, landing on a whole dB.
     func step(_ delta: Double) {
-        guard let monitor, let current = db else { return }
+        guard let monitor, let current = db, online else { return }
         let target = min(Self.maxDb, max(Self.minDb, (current + delta).rounded()))
         db = target   // optimistic, so held-key repeats compound correctly
         send(String(format: "set %@/CRMonitorLevel/value %.6f", monitor, target))
@@ -120,7 +139,7 @@ final class Engine {
     }
 
     func toggleMute() {
-        guard let monitor, db != nil else { return }
+        guard let monitor, isLive else { return }
         muted.toggle()
         send("set \(monitor)/Mute/value \(muted ? "true" : "false")")
         onChange()
@@ -155,7 +174,7 @@ func defaultOutputIsApollo() -> Bool {
 
 // MARK: - App
 
-final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class App: NSObject, NSApplicationDelegate {
     let engine = Engine()
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var apolloIsOutput = false
@@ -164,15 +183,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem.button?.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
-        let menu = NSMenu()
-        menu.delegate = self
-        statusItem.menu = menu
+        statusItem.button?.target = self
+        statusItem.button?.action = #selector(clicked)
 
         engine.onChange = { [weak self] in self?.refresh() }
         engine.connect()
-        // The engine's own clients write /Sleep every few seconds to keep the socket open.
         Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
-            self?.engine.send("set /Sleep false")
+            self?.engine.keepAlive()
         }
 
         // Cached and updated by a listener, so the key handler never waits on Core Audio.
@@ -237,45 +254,107 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return true
     }
 
+    /// The item is in the menu bar only while the Apollo is connected. It has
+    /// no menu; everything else is done with the command line (see runCLI).
     private func refresh() {
+        statusItem.isVisible = engine.isLive
+        guard let db = engine.db, engine.isLive else { return }
         let title: String
         if tap == nil {
             title = "⚠︎ Vol"
-        } else if let db = engine.db, engine.isLive {
-            title = engine.muted ? "Muted" : String(format: "%.0f dB", db)
         } else {
-            title = "– dB"
+            title = engine.muted ? "Muted" : String(format: "%.0f dB", db)
         }
         statusItem.button?.title = title
+        statusItem.button?.toolTip = tap == nil ? "Click to grant Accessibility" : nil
     }
 
-    // MARK: Menu
-
-    func menuNeedsUpdate(_ menu: NSMenu) {
-        menu.removeAllItems()
-        if tap == nil {
-            menu.addItem(withTitle: "Grant Accessibility…", action: #selector(openAccessibility), keyEquivalent: "").target = self
-        } else if !engine.isLive {
-            menu.addItem(withTitle: "UA Mixer Engine not reachable", action: nil, keyEquivalent: "")
-        } else if !apolloIsOutput {
-            menu.addItem(withTitle: "Apollo is not the system output", action: nil, keyEquivalent: "")
-        }
-        let login = menu.addItem(withTitle: "Start at Login", action: #selector(toggleLogin), keyEquivalent: "")
-        login.target = self
-        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        menu.addItem(.separator())
-        menu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-    }
-
-    @objc private func openAccessibility() {
+    /// Clicking the item does nothing unless Accessibility is still missing.
+    @objc private func clicked() {
+        guard tap == nil else { return }
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
     }
-
-    @objc private func toggleLogin() {
-        let service = SMAppService.mainApp
-        if service.status == .enabled { try? service.unregister() } else { try? service.register() }
-    }
 }
+
+// MARK: - Command line
+
+let bundleID = Bundle.main.bundleIdentifier ?? "local.apollo-volume-keys"
+
+func runningApps() -> [NSRunningApplication] {
+    NSRunningApplication.runningApplications(withBundleIdentifier: bundleID)
+        .filter { $0.processIdentifier != getpid() }
+}
+
+func fail(_ message: String) -> Never {
+    FileHandle.standardError.write(Data("apollo-volume-keys: \(message)\n".utf8))
+    exit(1)
+}
+
+/// Ask the mixer engine directly, so `status` works whether or not the app runs.
+func apolloStatus() -> String {
+    let engine = Engine()
+    engine.connect()
+    let deadline = Date().addingTimeInterval(1)
+    while engine.db == nil, Date() < deadline {   // the level is the last thing to arrive
+        RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
+    }
+    guard let db = engine.db else { return "UA Mixer Engine not reachable" }
+    guard engine.isLive else { return "not connected" }
+    return engine.muted ? "connected, muted" : String(format: "connected, %.0f dB", db)
+}
+
+func runCLI(_ args: [String]) -> Never {
+    let usage = """
+        usage: apollo-volume-keys <command>
+
+          status         show whether the app is running, start at login, and the Apollo
+          start          launch the menu-bar app
+          quit           quit the menu-bar app
+          login on|off   start the app at login, or stop doing so
+        """
+    switch args.first {
+    case "status" where args.count == 1:
+        print("App:            \(runningApps().isEmpty ? "not running" : "running")")
+        print("Start at login: \(SMAppService.mainApp.status == .enabled ? "on" : "off")")
+        print("Apollo:         \(apolloStatus())")
+    case "start" where args.count == 1:
+        if !runningApps().isEmpty { print("Already running."); break }
+        let open = Process()
+        open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        open.arguments = [Bundle.main.bundleURL.path]
+        do { try open.run() } catch { fail("could not launch: \(error.localizedDescription)") }
+        open.waitUntilExit()
+        if open.terminationStatus != 0 { fail("could not launch \(Bundle.main.bundleURL.path)") }
+        print("Started.")
+    case "quit" where args.count == 1:
+        let apps = runningApps()
+        if apps.isEmpty { print("Not running."); break }
+        apps.forEach { $0.terminate() }
+        let deadline = Date().addingTimeInterval(3)
+        while apps.contains(where: { !$0.isTerminated }), Date() < deadline {
+            RunLoop.main.run(mode: .default, before: Date().addingTimeInterval(0.05))
+        }
+        if apps.contains(where: { !$0.isTerminated }) { fail("the app did not quit") }
+        print("Quit.")
+    case "login" where args.count == 2 && ["on", "off"].contains(args[1]):
+        let service = SMAppService.mainApp, on = args[1] == "on"
+        do {
+            if on, service.status != .enabled { try service.register() }
+            if !on, service.status == .enabled { try service.unregister() }
+        } catch { fail("could not change start at login: \(error.localizedDescription)") }
+        print("Start at login: \(on ? "on" : "off")")
+    case "help", "-h", "--help":
+        print(usage)
+    default:
+        FileHandle.standardError.write(Data((usage + "\n").utf8))
+        exit(2)
+    }
+    exit(0)
+}
+
+// Any argument makes this a command; launched as an app there are none.
+let arguments = Array(CommandLine.arguments.dropFirst())
+if !arguments.isEmpty { runCLI(arguments) }
 
 let app = NSApplication.shared
 let delegate = App()

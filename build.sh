@@ -1,7 +1,8 @@
 #!/bin/bash
 # Build "Apollo Volume Keys.app" into ./build.
 #   ./build.sh            build only
-#   ./build.sh install    build, copy to ~/Applications, and (re)launch
+#   ./build.sh install    build, copy to ~/Applications, (re)launch, and put
+#                         the apollo-volume-keys command in ~/.local/bin
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -23,6 +24,15 @@ if [ "${1:-}" = install ]; then
     mkdir -p "$HOME/Applications"
     rm -rf "$DEST"
     cp -R "$APP" "$DEST"
-    open "$DEST"
+    # Launch Services can still be tearing down the instance killed above.
+    open "$DEST" || { sleep 2; open "$DEST"; }
+    # The same binary is the command-line tool; run it for the commands.
+    mkdir -p "$HOME/.local/bin"
+    # A wrapper, not a symlink: through a symlink the binary can't find its bundle.
+    CLI="$HOME/.local/bin/apollo-volume-keys"
+    rm -f "$CLI"
+    printf '#!/bin/sh\nexec "%s/Contents/MacOS/ApolloVolumeKeys" "$@"\n' "$DEST" > "$CLI"
+    chmod +x "$CLI"
     echo "Installed and launched $DEST"
+    echo "Installed the apollo-volume-keys command in ~/.local/bin"
 fi
