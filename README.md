@@ -106,3 +106,7 @@ The mixer engine protocol details were learned from
 [apollo-monitor-menubar](https://github.com/nicholaspsmith/apollo-monitor-menubar),
 a fuller-featured app that does the same job with a slider, overlay and
 engine recovery. This is an independent, minimal reimplementation.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
